@@ -47,41 +47,34 @@ spirals.
 
 ## Install
 
-~~~bash
-git clone https://github.com/oakwood-commons/spiral-guard ~/spiral-guard
-~~~
-
-Then pick ONE of these (each is just a different scoping):
-
-**1. Global auto-discovery** (every project, every machine user) -- drop the
-file into the global plugin directory; opencode auto-loads every `*.ts`
-found there:
-
-~~~bash
-cp ~/spiral-guard/spiral-guard.ts ~/.config/opencode/plugins/
-~~~
-
-**2. Per-project** -- drop it into that repo's `.opencode/plugin/`
-(auto-discovered for sessions in that repo only). Good when one repo
-wants the guard and others should not get its toasts:
-
-~~~bash
-mkdir -p <repo>/.opencode/plugin
-cp ~/spiral-guard/spiral-guard.ts <repo>/.opencode/plugin/
-~~~
-
-**3. Explicit plugin-array entry** -- reference the cloned file from
-`opencode.jsonc` instead of copying it (stays a single file to
-`git pull`):
+**One line, installs straight from this repo** (verified against
+opencode's plugin installer) -- add to `~/.config/opencode/opencode.jsonc`:
 
 ~~~jsonc
-"plugin": ["file:///abs/path/to/spiral-guard/spiral-guard.ts"]
+"plugin": ["github:oakwood-commons/spiral-guard"]
 ~~~
 
+Then restart opencode (plugins load once at startup). opencode clones the
+repo into its own package cache (`~/.cache/opencode/packages/`) -- no
+manual clone, no copy, no npm account.
+
+**Updating to a newer version**: the cached copy is only fetched once, so
+after upstream changes, clear the cached clone and restart:
+
+~~~bash
+rm -rf ~/.cache/opencode/packages/github:oakwood-commons/spiral-guard
+~~~
+
+Alternatives, when you prefer them:
+
+- **Global file copy** (no git spec; you own updates by re-copying):
+  `cp spiral-guard.ts ~/.config/opencode/plugins/` -- auto-discovered there.
+- **Per-project**: copy into that repo's `.opencode/plugin/` -- scoped to
+  sessions in that repo only.
+- **Explicit local path after a manual clone**:
+  `"plugin": ["file:///abs/path/to/spiral-guard/spiral-guard.ts"]`
+
 Requires no dependencies beyond opencode's own `@opencode-ai/plugin` API.
-**Restart opencode after installing** -- plugins are loaded once at
-startup, not hot-reloaded, so a running session keeps the already-loaded
-set until relaunched.
 
 ## Tuning
 

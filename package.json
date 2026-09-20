@@ -1,5 +1,5 @@
 {
-  "name": "spiral-guard",
+  "name": "@oakwood-commons/spiral-guard",
   "version": "0.1.0",
   "description": "opencode plugin: failure-spiral detection. Nudges the model out of repeating-failure and read-without-write loops before the session burns.",
   "type": "module",
@@ -8,9 +8,20 @@
     "test": "node --test spiral-guard.test.mjs"
   },
   "keywords": ["opencode", "opencode-plugin", "agent-safety", "doom-loop"],
-  "files": ["spiral-guard.ts"],
+  "files": ["spiral-guard.ts", "README.md", "LICENSE"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/oakwood-commons/spiral-guard.git"
+  },
+  "bugs": {
+    "url": "https://github.com/oakwood-commons/spiral-guard/issues"
+  },
+  "homepage": "https://github.com/oakwood-commons/spiral-guard#readme",
   "license": "MIT",
   "peerDependencies": {
     "@opencode-ai/plugin": "*"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
