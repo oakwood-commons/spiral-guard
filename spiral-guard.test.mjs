@@ -8,6 +8,11 @@ import { test } from "node:test"
 const src = readFileSync(new URL("./spiral-guard.ts", import.meta.url), "utf8")
 
 function extract(name) {
+  // SAFELIST first (SAST hardening): this helper interpolates `name` into a
+  // RegExp, so it must reject anything that is not a plain JS identifier --
+  // the tests only ever pass literal identifiers from the names array, but
+  // the invariant is documented and enforced here rather than assumed.
+  if (!/^[A-Za-z_$][\w$]*$/.test(name)) throw new Error(`invalid extract name: ${name}`)
   // Match `const NAME = ...` or `function NAME(...) {...}` up to the next
   // top-level declaration or `// ---` separator line. No bare `\n$`
   // alternative: with the "m" flag that matches every INTERNAL blank line,
@@ -112,4 +117,67 @@ test("IGNORED_TOOLS: meta/flaky tools are listed", () => {
   for (const t of ["task", "skill", "todowrite", "todoread", "webfetch"]) {
     if (!IGNORED_TOOLS.has(t)) throw new Error(t + " missing from IGNORED_TOOLS")
   }
+})
+
+// ---------------------------------------------------------------------------
+// Env contract: the config block reads SPIRAL_GUARD_* at module scope. These
+// tests rebuild the closure under controlled process.env so a renamed/dead
+// env var or a broken clamp fails loudly instead of silently restoring
+// defaults (the watchdog->spiral-guard rename means any reverted env name
+// in a shell rc silently restores defaults -- pinned the same way here as
+// in the source config repo).
+
+function buildConfig(envPatch) {
+  // `undefined` = ensure the var is UNSET (empty string is NOT unset: `??` is
+  // nullish-coalescing and "" flows into Number() as 0).
+  const names = ["DISABLED", "SOFT", "HARD", "READ_SPY", "MAX_FIRES", "LOG_PATH", "DEBUG", "DELEGATE_HINT"]
+  const re = new RegExp(`^const\\s+(?:${names.join("|")})\\b[\\s\\S]*?(?=\\nconst|\\nfunction|\\n//\\s*---)`, "gm")
+  const body = src.match(re).join("\n")
+  const saved = {}
+  for (const [k, v] of Object.entries(envPatch)) {
+    saved[k] = process.env[k]
+    if (v === undefined) delete process.env[k]
+    else process.env[k] = v
+  }
+  try {
+    return new Function(body + "\nreturn { DISABLED, SOFT, HARD, READ_SPY, MAX_FIRES, LOG_PATH, DEBUG, DELEGATE_HINT }")()
+  } finally {
+    for (const k of Object.keys(saved)) {
+      if (saved[k] === undefined) delete process.env[k]
+      else process.env[k] = saved[k]
+    }
+  }
+}
+
+test("env defaults with everything unset", () => {
+  const c = buildConfig({
+    SPIRAL_GUARD_DISABLED: undefined,
+    SPIRAL_GUARD_FAIL_THRESHOLD: undefined,
+    SPIRAL_GUARD_HARD_THRESHOLD: undefined,
+    SPIRAL_GUARD_READ_SPY: undefined,
+    SPIRAL_GUARD_MAX_FIRES: undefined,
+    SPIRAL_GUARD_DELEGATE_HINT: undefined,
+  })
+  if (c.SOFT !== 2) throw new Error("SOFT default: " + c.SOFT)
+  if (c.HARD !== 3) throw new Error("HARD default: " + c.HARD)
+  if (c.READ_SPY !== 3) throw new Error("READ_SPY default: " + c.READ_SPY)
+  if (c.MAX_FIRES !== 2) throw new Error("MAX_FIRES default: " + c.MAX_FIRES)
+  if (c.DELEGATE_HINT !== "") throw new Error("DELEGATE_HINT default not empty")
+  if (c.DISABLED !== false) throw new Error("DISABLED default")
+  if (c.LOG_PATH.indexOf("spiral-guard") === -1) throw new Error("LOG_PATH lost name: " + c.LOG_PATH)
+})
+
+test("env overrides + clamps", () => {
+  const c = buildConfig({
+    SPIRAL_GUARD_FAIL_THRESHOLD: "5",
+    SPIRAL_GUARD_HARD_THRESHOLD: "4", // below SOFT+1 -> clamps
+    SPIRAL_GUARD_READ_SPY: "1", // below floor 2 -> clamps
+    SPIRAL_GUARD_MAX_FIRES: "7",
+    SPIRAL_GUARD_DELEGATE_HINT: "my cheap subagent",
+  })
+  if (c.SOFT !== 5) throw new Error("SOFT override: " + c.SOFT)
+  if (c.HARD !== 6) throw new Error("HARD must clamp to SOFT+1: " + c.HARD)
+  if (c.READ_SPY !== 2) throw new Error("READ_SPY clamp: " + c.READ_SPY)
+  if (c.MAX_FIRES !== 7) throw new Error("MAX_FIRES override: " + c.MAX_FIRES)
+  if (c.DELEGATE_HINT !== "my cheap subagent") throw new Error("hint override: " + c.DELEGATE_HINT)
 })
