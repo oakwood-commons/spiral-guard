@@ -47,20 +47,41 @@ spirals.
 
 ## Install
 
-Clone, then register the plugin with opencode. Either copy the file into
-your project/global plugin directory (auto-discovered):
-
 ~~~bash
-cp spiral-guard.ts ~/.config/opencode/plugins/
+git clone https://github.com/oakwood-commons/spiral-guard ~/spiral-guard
 ~~~
 
-...or reference it by path in your `opencode.jsonc` plugin array:
+Then pick ONE of these (each is just a different scoping):
+
+**1. Global auto-discovery** (every project, every machine user) -- drop the
+file into the global plugin directory; opencode auto-loads every `*.ts`
+found there:
+
+~~~bash
+cp ~/spiral-guard/spiral-guard.ts ~/.config/opencode/plugins/
+~~~
+
+**2. Per-project** -- drop it into that repo's `.opencode/plugin/`
+(auto-discovered for sessions in that repo only). Good when one repo
+wants the guard and others should not get its toasts:
+
+~~~bash
+mkdir -p <repo>/.opencode/plugin
+cp ~/spiral-guard/spiral-guard.ts <repo>/.opencode/plugin/
+~~~
+
+**3. Explicit plugin-array entry** -- reference the cloned file from
+`opencode.jsonc` instead of copying it (stays a single file to
+`git pull`):
 
 ~~~jsonc
-"plugin": ["~/code/spiral-guard/spiral-guard.ts"]
+"plugin": ["file:///abs/path/to/spiral-guard/spiral-guard.ts"]
 ~~~
 
 Requires no dependencies beyond opencode's own `@opencode-ai/plugin` API.
+**Restart opencode after installing** -- plugins are loaded once at
+startup, not hot-reloaded, so a running session keeps the already-loaded
+set until relaunched.
 
 ## Tuning
 
