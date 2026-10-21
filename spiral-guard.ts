@@ -239,9 +239,13 @@ function xmlEscape(input: string): string {
 
 const WINDOWS_APP_ID = "Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"
 
-async function toast(title: string, message: string) {
+async function toast(title: string, message: string, opts?: { hard?: boolean }) {
   const now = Date.now()
-  if (now - lastToastAt < 3000) return // de-bounce bursts
+  // De-bounce bursts -- but NEVER drop a HARD escalation: HARD is one-shot
+  // (hardFired is consumed when it fires), so swallowing it here would
+  // permanently lose the strongest warning. The debounce exists only to
+  // stop toast spam; a HARD escalation is the one toast worth two of.
+  if (!opts?.hard && now - lastToastAt < 3000) return // de-bounce bursts
   lastToastAt = now
   try {
     const env = process.env
@@ -260,19 +264,25 @@ async function toast(title: string, message: string) {
         message,
       ])
     } else if (env.WSL_DISTRO_NAME || env.WSL_INTEROP) {
-      // Only the XML-escaped title/message are embedded in the toast XML
-      // document, and the XML itself is embedded in the PowerShell script
-      // as a single-quoted string with ' doubled -- the script is otherwise
-      // a fixed string. Passed as the single -Command argument, no shell.
+      // The toast XML (with the XML-escaped title/message inside it) is
+      // passed to PowerShell as base64 and decoded IN the script: the
+      // notification text is data by construction and can never become
+      // PowerShell syntax. Neither XML escaping nor doubling `'` is
+      // sufficient on its own -- PowerShell (7.2+) also treats the smart
+      // apostrophes U+2018/U+2019 as single-quote delimiters, so a toast
+      // title containing `'); <command>; #` would otherwise break out of
+      // the LoadXml('...') literal and execute. Base64 has no
+      // metacharacters to escape; found in review of this port.
       const xml =
         `<toast><visual><binding template="ToastText02">` +
         `<text id="1">${xmlEscape(title)}</text>` +
         `<text id="2">${xmlEscape(message)}</text>` +
         `</binding></visual></toast>`
+      const b64 = Buffer.from(xml, "utf-16le").toString("base64")
       const script =
         `$null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime]; ` +
         `$doc = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType=WindowsRuntime]::new(); ` +
-        `$doc.LoadXml('${xml.replace(/'/g, "''")}'); ` +
+        `$doc.LoadXml([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${b64}'))); ` +
         `$toast = [Windows.UI.Notifications.ToastNotification]::new($doc); ` +
         `[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('${WINDOWS_APP_ID}').Show($toast);`
       await execFileAsync("powershell.exe", ["-NoProfile", "-Command", script])
@@ -471,7 +481,7 @@ function evaluate(
   // HARD escalation (HARD is the one you most want when truly stuck).
   if (p.fails >= HARD && !p.hardFired) {
     p.hardFired = true
-    toast("spiral-guard", `Escalate now: ${target}`).catch(() => {})
+    toast("spiral-guard", `Escalate now: ${target}`, { hard: true }).catch(() => {})
     const text = hardText(target)
     log("HARD", target, { sessionID, text })
     return text
