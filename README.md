@@ -74,7 +74,8 @@ Alternatives, when you prefer them:
 - **Explicit local path after a manual clone**:
   `"plugin": ["file:///abs/path/to/spiral-guard/spiral-guard.ts"]`
 
-Requires no dependencies beyond opencode's own `@opencode-ai/plugin` API.
+Requires no dependencies beyond opencode's own `@opencode/plugin` API
+(opencode 2.0 plugin API).
 
 ## Tuning
 
