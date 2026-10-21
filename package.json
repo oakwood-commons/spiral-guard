@@ -1,6 +1,6 @@
 {
   "name": "@oakwood-commons/spiral-guard",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "opencode plugin: failure-spiral detection. Nudges the model out of repeating-failure and read-without-write loops before the session burns.",
   "type": "module",
   "main": "spiral-guard.ts",
@@ -19,7 +19,7 @@
   "homepage": "https://github.com/oakwood-commons/spiral-guard#readme",
   "license": "MIT",
   "peerDependencies": {
-    "@opencode-ai/plugin": "*"
+    "@opencode/plugin": "*"
   },
   "publishConfig": {
     "access": "public"
