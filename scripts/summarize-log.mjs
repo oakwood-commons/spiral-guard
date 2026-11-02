@@ -51,34 +51,50 @@ export function summarizeLog(content) {
     HARD: emptyOutcomeBucket(),
   }
 
-  function recordOutcome(item, outcome) {
+  function adjustOutcome(item, outcome, delta) {
     if (!outcomes[outcome] && outcomes[outcome] !== 0) return
-    outcomes[outcome] += 1
+    outcomes[outcome] += delta
     const tool = item.tool || "unknown"
     if (!byTool[tool]) byTool[tool] = emptyOutcomeBucket()
-    byTool[tool].total += 1
-    byTool[tool][outcome] += 1
+    byTool[tool].total += delta
+    byTool[tool][outcome] += delta
 
     const deliv = item.delivery || "unrecorded"
     if (!byDelivery[deliv]) byDelivery[deliv] = emptyOutcomeBucket()
-    byDelivery[deliv].total += 1
-    byDelivery[deliv][outcome] += 1
+    byDelivery[deliv].total += delta
+    byDelivery[deliv][outcome] += delta
 
     if (item.trigger && byTrigger[item.trigger]) {
-      byTrigger[item.trigger].total += 1
-      byTrigger[item.trigger][outcome] += 1
+      byTrigger[item.trigger].total += delta
+      byTrigger[item.trigger][outcome] += delta
     }
+  }
+
+  function recordOutcome(item, outcome) {
+    adjustOutcome(item, outcome, 1)
   }
 
   // Keyed by `${sessionID}\0${target}` for pending SOFT/HARD nudges.
   const pending = new Map()
+  // Keyed by `${sessionID}\0${target}` for fallback-inferred outcomes so a
+  // later explicit `kind === "outcome"` record for the same trigger reconciles
+  // (replaces) the inferred outcome rather than double-counting.
+  const inferred = new Map()
   let totalLines = 0
 
-  function resolveOtherTargetsInSession(sessionID, currentTarget) {
+  function resolveOtherTargetsInSession(sessionID, currentTarget, currentKind) {
+    if (toolOfTarget(currentTarget) === "read") return
+    // A successful write (`fail-streak-reset` on `write: <path>`) recovers a
+    // pending `edit: <path>` rather than moving on from it.
+    const recoveredEditTarget =
+      currentKind === "fail-streak-reset" && currentTarget.startsWith("write: ")
+        ? `edit: ${currentTarget.slice("write: ".length)}`
+        : undefined
     for (const [k, cur] of pending) {
-      if (cur.sessionID === sessionID && cur.target !== currentTarget) {
+      if (cur.sessionID === sessionID && cur.target !== currentTarget && cur.target !== recoveredEditTarget) {
         pending.delete(k)
         recordOutcome(cur, "moved-on")
+        inferred.set(k, { item: cur, outcome: "moved-on" })
       }
     }
   }
@@ -103,10 +119,13 @@ export function summarizeLog(content) {
     const key = `${sessionID}\0${target}`
 
     if (kind === "SOFT" || kind === "HARD") {
-      resolveOtherTargetsInSession(sessionID, target)
+      if (tool !== "read") {
+        resolveOtherTargetsInSession(sessionID, target, kind)
+      }
       triggers[kind] += 1
       triggers.nudgeTotal += 1
       triggers.total += 1
+      inferred.delete(key)
       // If a previous nudge on the exact same (sessionID, target) was still
       // pending without an explicit outcome, it failed again to reach here.
       const prev = pending.get(key)
@@ -146,7 +165,13 @@ export function summarizeLog(content) {
         const cur = pending.get(key)
         if (cur) {
           pending.delete(key)
+          inferred.delete(key)
           recordOutcome(cur, out)
+        } else if (inferred.has(key)) {
+          const prevInf = inferred.get(key)
+          inferred.delete(key)
+          adjustOutcome(prevInf.item, prevInf.outcome, -1)
+          recordOutcome(prevInf.item, out)
         } else {
           recordOutcome(
             {
@@ -169,13 +194,14 @@ export function summarizeLog(content) {
     // target. Interleaved read calls never touch pending edit/bash nudges.
     if (tool === "read") continue
 
-    resolveOtherTargetsInSession(sessionID, target)
+    resolveOtherTargetsInSession(sessionID, target, kind)
 
     if (kind === "fail-streak-reset") {
       const cur = pending.get(key)
       if (cur) {
         pending.delete(key)
         recordOutcome(cur, "recovered")
+        inferred.set(key, { item: cur, outcome: "recovered" })
       }
       continue
     }
@@ -185,6 +211,7 @@ export function summarizeLog(content) {
       if (cur) {
         pending.delete(key)
         recordOutcome(cur, "failed-again")
+        inferred.set(key, { item: cur, outcome: "failed-again" })
       }
       continue
     }

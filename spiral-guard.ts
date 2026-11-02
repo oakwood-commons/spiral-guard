@@ -77,16 +77,22 @@ const DELEGATE_HINT = process.env.SPIRAL_GUARD_DELEGATE_HINT ?? ""
 
 const softText = (target: string) =>
   `[spiral-guard -- SOFT] ${SOFT} consecutive failures on ${target}. ` +
-  `Do NOT retry the exact same call. Change approach: re-read the relevant ` +
-  `section with Read offset/limit, check a different source, or try a ` +
-  `different command. If a specialized subagent fits this step better` +
+  `Do NOT retry the exact same call. Change approach: ` +
+  (target.startsWith("edit:")
+    ? `re-read the target lines with read (offset/limit) to verify exact whitespace/context, or switch to write for this file. `
+    : `re-read the relevant section with Read offset/limit, check a different source, or try a different command. `) +
+  `If a specialized subagent fits this step better` +
   (DELEGATE_HINT ? ` (${DELEGATE_HINT})` : "") +
   `, consider delegating instead of a third attempt in this same approach.`
 
 const hardText = (target: string) =>
   `[spiral-guard -- HARD] ${HARD} consecutive failures on ${target}. ` +
-  `Stop repeating this approach. Either delegate this step ` +
-  (DELEGATE_HINT ? `to ${DELEGATE_HINT}, ` : `to a subagent suited to it, `) +
+  `Stop repeating this approach. ` +
+  (target.startsWith("edit:")
+    ? `Re-read the target lines with read or switch to write for this file, ` +
+      (DELEGATE_HINT ? `delegate this step to ${DELEGATE_HINT}, ` : `delegate this step to a subagent suited to it, `)
+    : `Either delegate this step ` +
+      (DELEGATE_HINT ? `to ${DELEGATE_HINT}, ` : `to a subagent suited to it, `)) +
   `or step back and diagnose why this keeps failing (wrong assumption about ` +
   `the file/command/API?) before any further attempt. Do not attempt a ` +
   `third variant of the same approach.`
@@ -439,10 +445,28 @@ function probeShape(tool: string, ev: { status?: unknown; message?: unknown; con
 // the plugin block at the bottom for why the previous approach could not.
 
 function evaluate(sessionID: string, tool: string, args: unknown, ev: { status?: unknown; message?: unknown; content?: unknown; metadata?: unknown }): string | undefined {
-  if (DISABLED || IGNORED_TOOLS.has(tool)) return
+  if (DISABLED) return
   if (DEBUG) probeShape(tool, ev)
 
   const state = sessionState(sessionID)
+  if (IGNORED_TOOLS.has(tool)) {
+    // Delegating (`task`) or invoking other ignored meta tools after a
+    // SOFT/HARD nudge resolves any pending nudge in this session as "moved-on",
+    // while still excluding ignored tools from failure detection and escalation.
+    for (const [otherTarget, otherPair] of state.pairs) {
+      if (otherPair.pendingNudge) {
+        log("outcome", otherTarget, {
+          sessionID,
+          trigger: otherPair.pendingNudge,
+          outcome: "moved-on",
+          streak: otherPair.fails,
+        })
+        otherPair.pendingNudge = undefined
+      }
+    }
+    return
+  }
+
   const target = targetOf(tool, args)
   const p = pairFor(state, target)
   const isError = detectFailure(tool, ev)

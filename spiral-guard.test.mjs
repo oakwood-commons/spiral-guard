@@ -451,6 +451,8 @@ test("execute.after: status=error delivers nudge in-band, logs injected-error, a
   const ev2 = { tool: "edit", sessionID, input, status: "error", error: { message: "oldString not found (2)" } }
   handleAfter(ev2)
   if (!ev2.error.message.includes("[spiral-guard -- SOFT]")) throw new Error("SOFT nudge missing from ev.error.message")
+  if (!ev2.error.message.includes("re-read the target lines with read") || !ev2.error.message.includes("switch to write"))
+    throw new Error("edit SOFT nudge missing read/write guidance: " + ev2.error.message)
   if (!logs.some((l) => l.kind === "injected-error" && l.target === "edit: /app/foo.ts"))
     throw new Error("expected injected-error log")
   if (toasts.length !== 0) throw new Error("SOFT toast should NOT fire when in-band injection succeeds")
@@ -459,6 +461,8 @@ test("execute.after: status=error delivers nudge in-band, logs injected-error, a
   const ev3 = { tool: "edit", sessionID, input, status: "error", error: { message: "oldString not found (3)" } }
   handleAfter(ev3)
   if (!ev3.error.message.includes("[spiral-guard -- HARD]")) throw new Error("HARD nudge missing from ev.error.message")
+  if (!ev3.error.message.includes("Re-read the target lines with read or switch to write"))
+    throw new Error("edit HARD nudge missing read/write guidance: " + ev3.error.message)
   const softOutcome = logs.find((l) => l.kind === "outcome" && l.trigger === "SOFT")
   if (!softOutcome || softOutcome.outcome !== "failed-again" || softOutcome.streak !== 3)
     throw new Error("expected SOFT failed-again outcome at streak 3, got: " + JSON.stringify(softOutcome))
@@ -554,6 +558,13 @@ test("outcomes + write-resets-edit: interleaved reads preserve pending edit nudg
   const movedOn = [...logs].reverse().find((l) => l.kind === "outcome" && l.target === "edit: /app/baz.ts")
   if (!movedOn || movedOn.outcome !== "moved-on" || movedOn.trigger !== "SOFT")
     throw new Error("expected moved-on outcome when switching to another non-read target: " + JSON.stringify(movedOn))
+
+  // Delegating via an IGNORED_TOOLS entry (`task`) after a HARD trigger also resolves pendingNudge as moved-on
+  handleAfter({ tool: "edit", sessionID, input, status: "error", error: { message: "fail 3" } })
+  handleAfter({ tool: "task", sessionID, input: { description: "delegate" }, status: "completed", result: { content: "done" } })
+  const movedOnViaTask = [...logs].reverse().find((l) => l.kind === "outcome" && l.target === "edit: /app/baz.ts")
+  if (!movedOnViaTask || movedOnViaTask.outcome !== "moved-on" || movedOnViaTask.trigger !== "HARD")
+    throw new Error("expected moved-on outcome when delegating via task tool: " + JSON.stringify(movedOnViaTask))
 })
 
 test("summarize-log: parses triggers, delivery breakdown, and per-tool/per-delivery outcomes", () => {
@@ -652,4 +663,23 @@ test("summarize-log: parses triggers, delivery breakdown, and per-tool/per-deliv
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+
+  // Edge case: read SOFT escalation + write fail-streak-reset before explicit edit recovery
+  // must not mark edit as moved-on or double-count outcomes.
+  const edgeLines = [
+    { kind: "SOFT", sessionID: "s4", target: "edit: /c.ts", text: "soft" },
+    { kind: "injected-error", sessionID: "s4", target: "edit: /c.ts", text: "soft" },
+    // Two failed reads trigger a read SOFT while edit is still pending
+    { kind: "SOFT", sessionID: "s4", target: "read: /c.ts", text: "read-soft" },
+    { kind: "injected-error", sessionID: "s4", target: "read: /c.ts", text: "read-soft" },
+    // Successful write resets an earlier write failure first, then emits explicit recovered outcome for edit
+    { kind: "fail-streak-reset", sessionID: "s4", target: "write: /c.ts", streak: 1 },
+    { kind: "outcome", sessionID: "s4", target: "edit: /c.ts", trigger: "SOFT", outcome: "recovered", streak: 2 },
+    { kind: "fail-streak-reset", sessionID: "s4", target: "edit: /c.ts", streak: 2 },
+  ]
+  const edgeSummary = summarizeLog(edgeLines.map((l) => JSON.stringify(l)).join("\n"))
+  if (edgeSummary.byTool.edit.total !== 1 || edgeSummary.byTool.edit.recovered !== 1 || edgeSummary.byTool.edit["moved-on"] !== 0)
+    throw new Error("edit outcome was double-counted or misclassified: " + JSON.stringify(edgeSummary.byTool.edit))
+  if (edgeSummary.byDelivery["injected-error"].recovered !== 1)
+    throw new Error("edit recovery lost injected-error delivery attribution: " + JSON.stringify(edgeSummary.byDelivery))
 })
