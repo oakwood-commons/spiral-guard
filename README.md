@@ -28,9 +28,9 @@ blocked call, no swallowed error.
 
 | Trigger | Default | Action |
 | --------- | --------- | -------- |
-| SOFT | 2 consecutive failures of one target | nudge appended to the tool output + desktop toast: change approach or delegate |
-| HARD | 3 consecutive failures of one target | stronger nudge: stop, delegate, or diagnose the wrong assumption |
-| Read-spy | 3 reads of one file with no interleaved write | toast only (are you about to loop?) |
+| SOFT | 2 consecutive failures of one target | nudge appended in-band to the tool output or error (`ev.result` / `ev.error`); desktop toast only as fallback if in-band injection is skipped |
+| HARD | 3 consecutive failures of one target | stronger in-band nudge + desktop toast: stop, delegate, or diagnose the wrong assumption |
+| Read-spy | 3 reads of one file with no interleaved write | concise one-line in-band hint appended to the `read` output (capped at 1 per file per write cycle; `SPIRAL_GUARD_READ_SPY=0` disables) |
 
 - A target's failure streak resets on any success anywhere in between.
 - SOFT injections are capped per target per session (default 2) -- the
@@ -51,18 +51,17 @@ spirals.
 opencode's plugin installer) -- add to `~/.config/opencode/opencode.jsonc`:
 
 ~~~jsonc
-"plugin": ["github:oakwood-commons/spiral-guard"]
+"plugin": ["github:oakwood-commons/spiral-guard#v2"]
 ~~~
 
 Then restart opencode (plugins load once at startup). opencode clones the
-repo into its own package cache (`~/.cache/opencode/packages/`) -- no
-manual clone, no copy, no npm account.
+repo into its own package cache -- no manual clone, no copy, no npm account.
 
 **Updating to a newer version**: the cached copy is only fetched once, so
 after upstream changes, clear the cached clone and restart:
 
 ~~~bash
-rm -rf ~/.cache/opencode/packages/github:oakwood-commons/spiral-guard
+rm -rf ~/.cache/opencode/npm/git-spiral-guard-* ~/.cache/opencode/packages/github:oakwood-commons/spiral-guard*
 ~~~
 
 Alternatives, when you prefer them:
@@ -85,12 +84,23 @@ All knobs are environment variables -- no code edits:
 | ----- | --------- | --------- |
 | `SPIRAL_GUARD_FAIL_THRESHOLD` | 2 | SOFT trigger after N consecutive failures |
 | `SPIRAL_GUARD_HARD_THRESHOLD` | 3 | HARD trigger after N |
-| `SPIRAL_GUARD_READ_SPY` | 3 | toast after N reads with no write |
+| `SPIRAL_GUARD_READ_SPY` | 3 | in-band hint after N reads with no write (`0` disables) |
 | `SPIRAL_GUARD_MAX_FIRES` | 2 | max SOFT+HARD injections per target per session |
 | `SPIRAL_GUARD_DELEGATE_HINT` | (generic) | names YOUR delegation target(s), e.g. `"a cheap mechanical-work subagent"` -- spliced into the nudge text |
 | `SPIRAL_GUARD_LOG` | `/tmp/opencode/spiral-guard.jsonl` | JSONL trigger log path |
 | `SPIRAL_GUARD_DEBUG` | off | dump the raw hook shape per tool call |
 | `SPIRAL_GUARD_DISABLED` | off | turn the plugin off entirely |
+
+Summarize trigger counts, in-band delivery breakdown (`injected`,
+`injected-error`, `injected-read-spy`, `injected-skipped-error-result`),
+and per-tool/per-delivery outcomes (`recovered`, `failed-again`,
+`moved-on`) from the JSONL log with:
+
+~~~bash
+npm run summary
+# or pass a custom log path / --json:
+node scripts/summarize-log.mjs /path/to/spiral-guard.jsonl
+~~~
 
 ## Related tools (and why they compose)
 

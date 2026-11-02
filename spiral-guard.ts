@@ -23,7 +23,7 @@
 // Tuning (env vars, no code edits needed):
 //   SPIRAL_GUARD_FAIL_THRESHOLD   SOFT trigger after N consecutive failures (default 2)
 //   SPIRAL_GUARD_HARD_THRESHOLD   HARD trigger after N consecutive failures (default 3)
-//   SPIRAL_GUARD_READ_SPY         toast after N reads of one file with no write (default 3)
+//   SPIRAL_GUARD_READ_SPY         in-band hint after N reads of one file with no write (default 3; 0 disables)
 //   SPIRAL_GUARD_MAX_FIRES        max SOFT+HARD injections per target per session (default 2)
 //   SPIRAL_GUARD_DELEGATE_HINT    optional hint naming YOUR delegation
 //                                 target(s), e.g. "a cheap subagent for
@@ -47,7 +47,10 @@ const execFileAsync = promisify(execFile)
 const DISABLED = process.env.SPIRAL_GUARD_DISABLED === "1"
 const SOFT = Math.max(1, Number(process.env.SPIRAL_GUARD_FAIL_THRESHOLD ?? 2))
 const HARD = Math.max(SOFT + 1, Number(process.env.SPIRAL_GUARD_HARD_THRESHOLD ?? 3))
-const READ_SPY = Math.max(2, Number(process.env.SPIRAL_GUARD_READ_SPY ?? 3))
+const READ_SPY =
+  Number(process.env.SPIRAL_GUARD_READ_SPY ?? 3) === 0
+    ? 0
+    : Math.max(2, Number(process.env.SPIRAL_GUARD_READ_SPY ?? 3))
 const MAX_FIRES = Math.max(1, Number(process.env.SPIRAL_GUARD_MAX_FIRES ?? 2))
 const LOG_PATH = process.env.SPIRAL_GUARD_LOG ?? "/tmp/opencode/spiral-guard.jsonl"
 const DEBUG = process.env.SPIRAL_GUARD_DEBUG === "1"
@@ -74,19 +77,29 @@ const DELEGATE_HINT = process.env.SPIRAL_GUARD_DELEGATE_HINT ?? ""
 
 const softText = (target: string) =>
   `[spiral-guard -- SOFT] ${SOFT} consecutive failures on ${target}. ` +
-  `Do NOT retry the exact same call. Change approach: re-read the relevant ` +
-  `section with Read offset/limit, check a different source, or try a ` +
-  `different command. If a specialized subagent fits this step better` +
+  `Do NOT retry the exact same call. Change approach: ` +
+  (target.startsWith("edit:")
+    ? `re-read the target lines with read (offset/limit) to verify exact whitespace/context, or switch to write for this file. `
+    : `re-read the relevant section with Read offset/limit, check a different source, or try a different command. `) +
+  `If a specialized subagent fits this step better` +
   (DELEGATE_HINT ? ` (${DELEGATE_HINT})` : "") +
   `, consider delegating instead of a third attempt in this same approach.`
 
 const hardText = (target: string) =>
   `[spiral-guard -- HARD] ${HARD} consecutive failures on ${target}. ` +
-  `Stop repeating this approach. Either delegate this step ` +
-  (DELEGATE_HINT ? `to ${DELEGATE_HINT}, ` : `to a subagent suited to it, `) +
+  `Stop repeating this approach. ` +
+  (target.startsWith("edit:")
+    ? `Re-read the target lines with read or switch to write for this file, ` +
+      (DELEGATE_HINT ? `delegate this step to ${DELEGATE_HINT}, ` : `delegate this step to a subagent suited to it, `)
+    : `Either delegate this step ` +
+      (DELEGATE_HINT ? `to ${DELEGATE_HINT}, ` : `to a subagent suited to it, `)) +
   `or step back and diagnose why this keeps failing (wrong assumption about ` +
   `the file/command/API?) before any further attempt. Do not attempt a ` +
   `third variant of the same approach.`
+
+const readSpyText = (target: string) =>
+  `[spiral-guard -- read-spy] ${READ_SPY} reads of ${target} without a write. ` +
+  `Make the edit/write you need or move on instead of re-reading.`
 
 // ---------------------------------------------------------------------------
 // State, scoped per opencode session (a single opencode process can host
@@ -97,8 +110,10 @@ const hardText = (target: string) =>
 interface Pair {
   fails: number
   reads: number
+  readFires: number
   softFires: number
   hardFired: boolean
+  pendingNudge?: "SOFT" | "HARD"
   lastError?: string
 }
 
@@ -136,7 +151,7 @@ function sessionState(sessionID: string): SessionState {
 function pairFor(state: SessionState, key: string): Pair {
   let p = state.pairs.get(key)
   if (!p) {
-    p = { fails: 0, reads: 0, softFires: 0, hardFired: false }
+    p = { fails: 0, reads: 0, readFires: 0, softFires: 0, hardFired: false }
     state.pairs.set(key, p)
   }
   return p
@@ -196,8 +211,15 @@ function targetOf(tool: string, args: unknown): string {
     const a = args as Record<string, unknown>
     switch (tool) {
       case "bash":
-      case "shell":
-        return `bash: ${String(a.command ?? "").trim().slice(0, 80)}`
+      case "shell": {
+        const raw = String(a.command ?? "").trim().replace(/\s+/g, " ")
+        let cmd = raw
+        const preamble = /^(?:cd|export)\s+(?:"[^"]*"|'[^']*'|[^;&|"'])+(?:&&|;)\s*/
+        while (preamble.test(cmd)) {
+          cmd = cmd.replace(preamble, "")
+        }
+        return `bash: ${(cmd || raw).slice(0, 80)}`
+      }
       case "edit":
       case "write":
         return `${tool}: ${String(a.path ?? a.filePath ?? "")}`
@@ -422,36 +444,61 @@ function probeShape(tool: string, ev: { status?: unknown; message?: unknown; con
 // makes the nudge land in the right conversation at the right moment -- see
 // the plugin block at the bottom for why the previous approach could not.
 
-function evaluate(
-  sessionID: string,
-  tool: string,
-  args: unknown,
-  ev: { status?: unknown; message?: unknown; content?: unknown; metadata?: unknown },
-): string | undefined {
-  if (DISABLED || IGNORED_TOOLS.has(tool)) return
+function evaluate(sessionID: string, tool: string, args: unknown, ev: { status?: unknown; message?: unknown; content?: unknown; metadata?: unknown }): string | undefined {
+  if (DISABLED) return
   if (DEBUG) probeShape(tool, ev)
 
   const state = sessionState(sessionID)
+  if (IGNORED_TOOLS.has(tool)) {
+    // Delegating (`task`) or invoking other ignored meta tools after a
+    // SOFT/HARD nudge resolves any pending nudge in this session as "moved-on",
+    // while still excluding ignored tools from failure detection and escalation.
+    for (const [otherTarget, otherPair] of state.pairs) {
+      if (otherPair.pendingNudge) {
+        log("outcome", otherTarget, {
+          sessionID,
+          trigger: otherPair.pendingNudge,
+          outcome: "moved-on",
+          streak: otherPair.fails,
+        })
+        otherPair.pendingNudge = undefined
+      }
+    }
+    return
+  }
+
   const target = targetOf(tool, args)
   const p = pairFor(state, target)
   const isError = detectFailure(tool, ev)
 
-  // Read-spy: reads of one file piling up with no interleaved write.
-  if (tool === "read") {
-    p.reads += 1
-    if (p.reads === READ_SPY) {
-      const msg = `Read-spy: ${READ_SPY} reads of ${target} without a write. Are you about to loop?`
-      toast("spiral-guard", msg).catch(() => {})
-      log("read-spy", target, { sessionID })
-      p.reads = 0 // arm again later if it keeps happening; no injection
+  // A successful tool call (including a retry of a previously failing
+  // `read: <path>`) resolves any pending nudge on this target and resets
+  // its failure streak before read-spy runs (deliberately NOT the read
+  // counter -- read-spy tracks a different smell). Interleaved reads still
+  // do not touch pending nudges on OTHER targets (`moved-on` below is gated
+  // on `tool !== "read"`).
+  if (!isError) {
+    if (p.pendingNudge) {
+      log("outcome", target, { sessionID, trigger: p.pendingNudge, outcome: "recovered", streak: p.fails })
+      p.pendingNudge = undefined
     }
-  }
-
-  // A successful non-read tool call resets the failure streak for this target
-  // (deliberately NOT the read counter -- read-spy tracks a different smell).
-  if (!isError && tool !== "read") {
     if (p.fails > 0) log("fail-streak-reset", target, { sessionID, streak: p.fails })
     p.fails = 0
+  }
+
+  // Read-spy: reads of one file piling up with no interleaved write.
+  // Appends a one-line in-band hint on the READ_SPY-th completed read,
+  // capped at 1 fire per file per write cycle (readFires resets on a
+  // successful edit/write to that path). SPIRAL_GUARD_READ_SPY=0 disables.
+  if (tool === "read" && !isError && READ_SPY > 0) {
+    p.reads += 1
+    if (p.reads >= READ_SPY && p.readFires < 1) {
+      p.readFires += 1
+      p.reads = 0
+      const text = readSpyText(target)
+      log("read-spy", target, { sessionID, text })
+      return text
+    }
   }
 
   // A successful edit/write to a file IS the write read-spy is waiting for,
@@ -460,6 +507,8 @@ function evaluate(
   // Without this, three reads of a file separated by a successful write to
   // that same file would still fire the read-spy warning, since nothing
   // ever touched the read pair's counter. Reset the read pair explicitly.
+  // A successful write to <path> also recovers/resets any active failure
+  // streak on "edit: <path>".
   // Both arg spellings accepted: 2.0 tools pass `path`, 1.x passed `filePath`.
   if (!isError && (tool === "edit" || tool === "write")) {
     const a = args && typeof args === "object" ? (args as Record<string, unknown>) : undefined
@@ -467,7 +516,47 @@ function evaluate(
     if (filePath) {
       const readTarget = `read: ${filePath}`
       const readPair = state.pairs.get(readTarget)
-      if (readPair && readPair.reads > 0) readPair.reads = 0
+      if (readPair) {
+        readPair.reads = 0
+        readPair.readFires = 0
+      }
+      if (tool === "write") {
+        const editTarget = `edit: ${filePath}`
+        const editPair = state.pairs.get(editTarget)
+        if (editPair) {
+          if (editPair.pendingNudge) {
+            log("outcome", editTarget, {
+              sessionID,
+              trigger: editPair.pendingNudge,
+              outcome: "recovered",
+              streak: editPair.fails,
+            })
+            editPair.pendingNudge = undefined
+          }
+          if (editPair.fails > 0) {
+            log("fail-streak-reset", editTarget, { sessionID, streak: editPair.fails })
+            editPair.fails = 0
+          }
+        }
+      }
+    }
+  }
+
+  // Any non-read tool call on a different target resolves pending nudges on
+  // earlier targets in this session as "moved-on" (except a successful write
+  // to the same file as a pending edit, which already resolved as "recovered"
+  // above).
+  if (tool !== "read") {
+    for (const [otherTarget, otherPair] of state.pairs) {
+      if (otherTarget !== target && otherPair.pendingNudge) {
+        log("outcome", otherTarget, {
+          sessionID,
+          trigger: otherPair.pendingNudge,
+          outcome: "moved-on",
+          streak: otherPair.fails,
+        })
+        otherPair.pendingNudge = undefined
+      }
     }
   }
 
@@ -475,12 +564,19 @@ function evaluate(
 
   p.fails += 1
   p.lastError = isError
+  if (p.pendingNudge) {
+    log("outcome", target, { sessionID, trigger: p.pendingNudge, outcome: "failed-again", streak: p.fails })
+    p.pendingNudge = undefined
+  }
   log("failure", target, { sessionID, streak: p.fails, error: p.lastError })
 
   // HARD and SOFT have independent caps: the SOFT cap cannot swallow the
   // HARD escalation (HARD is the one you most want when truly stuck).
+  // HARD fires its desktop toast unconditionally; SOFT toast fires in
+  // deliverNudge only as a fallback when in-band injection fails/skips.
   if (p.fails >= HARD && !p.hardFired) {
     p.hardFired = true
+    p.pendingNudge = "HARD"
     toast("spiral-guard", `Escalate now: ${target}`, { hard: true }).catch(() => {})
     const text = hardText(target)
     log("HARD", target, { sessionID, text })
@@ -488,7 +584,7 @@ function evaluate(
   }
   if (p.fails === SOFT && p.softFires < MAX_FIRES) {
     p.softFires += 1
-    toast("spiral-guard", `Change approach: ${target}`).catch(() => {})
+    p.pendingNudge = "SOFT"
     const text = softText(target)
     log("SOFT", target, { sessionID, text })
     return text
@@ -497,11 +593,12 @@ function evaluate(
 }
 
 // ---------------------------------------------------------------------------
-// Delivery: append the directive to the FAILING TOOL'S OWN OUTPUT.
+// Delivery: append the directive to the FAILING TOOL'S OWN OUTPUT (or ERROR).
 //
 // The 2.0 execute.after event hands us the mutable `result` of a completed
-// call, and mutating `result.content` is how a plugin alters a tool result
-// -- strictly better than the synthetic-message injection this plugin used
+// call (or `error` on a failed call), and mutating `result.content` /
+// `error.message` is how a plugin alters what the model sees in-band --
+// strictly better than the synthetic-message injection this plugin used
 // until 2026-09-12 (on the 1.x message transform hook), which was broken
 // in three independent ways:
 //
@@ -522,37 +619,115 @@ function evaluate(
 //      in particular rejects malformed sequences with errors like
 //      `messages: text content blocks must contain non-empty text`.
 //
-// Appending to the tool result avoids all three: it is inherently scoped to
-// the correct session (we are inside that session's tool call), it lands
-// exactly where the model is already reading, at the moment of failure, and
-// it changes only the text of a tool result -- a shape every provider
-// already accepts.
-//
-// Calls the host reports with status "error" carry no `result` to append to,
-// so those streaks escalate via toast only -- the streak still counts
-// toward SOFT/HARD, and the trigger logs above record what was said.
+// Appending to the tool result/error avoids all three: it is inherently
+// scoped to the correct session (we are inside that session's tool call),
+// it lands exactly where the model is already reading, at the moment of
+// failure, and it changes only the text of a tool result/error -- a shape
+// every provider already accepts.
 
 const NUDGE_SEPARATOR = "\n\n---\n"
 
 function appendNudge(result: unknown, nudge: string): boolean {
-  if (!result || typeof result !== "object") return false
-  const r = result as { content?: unknown }
-  const c = r.content
-  if (typeof c === "string") {
-    r.content = `${c}${NUDGE_SEPARATOR}${nudge}`
-    return true
+  try {
+    if (!result || typeof result !== "object" || Object.isFrozen(result)) return false
+    const r = result as Record<string, unknown>
+    const c = r.content
+    if (typeof c === "string") {
+      r.content = `${c}${NUDGE_SEPARATOR}${nudge}`
+      return r.content === `${c}${NUDGE_SEPARATOR}${nudge}`
+    }
+    if (Array.isArray(c)) {
+      // `content` is typed readonly on Tool.Result, but the event object is
+      // a plain mutable object at runtime -- assign a NEW array rather than
+      // mutating the old one, so the readonly contract is honored where it
+      // can be.
+      const next = [...c, { type: "text", text: nudge }]
+      r.content = next
+      return r.content === next
+    }
+    // No content at all: the nudge alone becomes it.
+    r.content = nudge
+    return r.content === nudge
+  } catch {
+    return false
   }
-  if (Array.isArray(c)) {
-    // `content` is typed readonly on Tool.Result, but the event object is
-    // a plain mutable object at runtime -- assign a NEW array rather than
-    // mutating the old one, so the readonly contract is honored where it
-    // can be.
-    r.content = [...c, { type: "text", text: nudge }]
-    return true
+}
+
+function appendErrorNudge(ev: unknown, nudge: string): boolean {
+  try {
+    if (!ev || typeof ev !== "object" || Object.isFrozen(ev)) return false
+    const e = ev as Record<string, unknown>
+    if (!e.error || typeof e.error !== "object" || Object.isFrozen(e.error)) return false
+    const orig = e.error as Record<string, unknown>
+    if (typeof orig.message !== "string" || !orig.message.trim()) return false
+    const nextMessage = `${orig.message}${NUDGE_SEPARATOR}${nudge}`
+    if (orig._tag === "Tool.Error") {
+      if (typeof orig.constructor !== "function") return false
+      try {
+        const props = {
+          message: nextMessage,
+          ...(orig.error !== undefined ? { error: orig.error } : {}),
+          ...(orig.metadata !== undefined ? { metadata: orig.metadata } : {}),
+        }
+        const rebuilt = Reflect.construct(orig.constructor, [props]) as Record<string, unknown>
+        if (
+          rebuilt &&
+          typeof rebuilt === "object" &&
+          rebuilt.message === nextMessage &&
+          (orig.error === undefined || rebuilt.error === orig.error) &&
+          (orig.metadata === undefined || rebuilt.metadata === orig.metadata)
+        ) {
+          e.error = rebuilt
+          return e.error === rebuilt
+        }
+      } catch {
+        return false
+      }
+      return false
+    }
+    orig.message = nextMessage
+    return orig.message === nextMessage
+  } catch {
+    return false
   }
-  // No content at all: the nudge alone becomes it.
-  r.content = nudge
-  return true
+}
+
+function deliverNudge(nudge: string, ev: { tool?: unknown; sessionID?: unknown; input?: unknown; status?: unknown; result?: unknown; error?: unknown }): boolean {
+  const tool = typeof ev.tool === "string" ? ev.tool : "unknown"
+  const sessionID = typeof ev.sessionID === "string" ? ev.sessionID : ""
+  const target = targetOf(tool, ev.input)
+  const isReadSpy = nudge.startsWith("[spiral-guard -- read-spy]")
+  const isSoft = nudge.startsWith("[spiral-guard -- SOFT]")
+  if (ev.status === "completed" && ev.result) {
+    const ok = appendNudge(ev.result, nudge)
+    log(ok ? (isReadSpy ? "injected-read-spy" : "injected") : "inject-failed", target, {
+      sessionID,
+      text: nudge,
+    })
+    if (!ok && isSoft) {
+      toast("spiral-guard", `Change approach: ${target}`).catch(() => {})
+    }
+    return ok
+  }
+  if (ev.status === "error") {
+    const ok = appendErrorNudge(ev, nudge)
+    log(ok ? "injected-error" : "injected-skipped-error-result", target, {
+      sessionID,
+      text: nudge,
+    })
+    if (!ok && isSoft) {
+      toast("spiral-guard", `Change approach: ${target}`).catch(() => {})
+    }
+    return ok
+  }
+  log("injected-skipped-error-result", target, {
+    sessionID,
+    text: nudge,
+  })
+  if (isSoft) {
+    toast("spiral-guard", `Change approach: ${target}`).catch(() => {})
+  }
+  return false
 }
 
 // 2.0 port: envelope + hook names verified against @opencode/plugin's tool
@@ -608,20 +783,7 @@ export default Plugin.define({
 
         const nudge = evaluate(ev.sessionID, ev.tool, ev.input, probe)
         if (nudge) {
-          if (ev.status === "completed" && ev.result) {
-            const ok = appendNudge(ev.result, nudge)
-            log(ok ? "injected" : "inject-failed", targetOf(ev.tool, ev.input), {
-              sessionID: ev.sessionID,
-              text: nudge,
-            })
-          } else {
-            // status "error": no result to carry the nudge; the toast and
-            // SOFT/HARD trigger logs above already record the escalation.
-            log("injected-skipped-error-result", targetOf(ev.tool, ev.input), {
-              sessionID: ev.sessionID,
-              text: nudge,
-            })
-          }
+          deliverNudge(nudge, ev)
         }
       } catch (err) {
         log("hook-crash", tool, { sessionID: (event as { sessionID?: string })?.sessionID, error: String(err) })
