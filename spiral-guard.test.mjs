@@ -3,8 +3,12 @@
 // technique: extract named declarations from the real .ts source, strip
 // TS-only syntax, evaluate in a shared closure. Run with:
 // node --test spiral-guard.test.mjs
-import { readFileSync } from "node:fs"
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { execFileSync } from "node:child_process"
 import { test } from "node:test"
+import { formatSummary, summarizeLog } from "./scripts/summarize-log.mjs"
 
 const src = readFileSync(new URL("./spiral-guard.ts", import.meta.url), "utf8")
 
@@ -28,7 +32,7 @@ function extract(name) {
 }
 
 function detype(code) {
-  const TYPE = String.raw`[A-Za-z_$][\w$]*(?:\[\])?`
+  const TYPE = String.raw`(?:string|number|boolean|unknown|void|SessionState|Pair)(?:\[\])?`
   return (
     code
       // `as` type casts -> drop (`args as Record<string, unknown>` -> `args`)
@@ -44,11 +48,22 @@ function detype(code) {
   )
 }
 
-const names = ["IGNORED_TOOLS", "targetOf", "detectFailure", "textOf", "xmlEscape"]
+const names = [
+  "IGNORED_TOOLS",
+  "NUDGE_SEPARATOR",
+  "targetOf",
+  "detectFailure",
+  "textOf",
+  "xmlEscape",
+  "appendNudge",
+  "appendErrorNudge",
+]
 const body = names.map((n) => detype(extract(n))).join("\n")
-const { targetOf, detectFailure, textOf, xmlEscape, IGNORED_TOOLS } = new Function(
-  body + "\nreturn { targetOf, detectFailure, textOf, xmlEscape, IGNORED_TOOLS }",
-)()
+const { targetOf, detectFailure, textOf, xmlEscape, IGNORED_TOOLS, NUDGE_SEPARATOR, appendNudge, appendErrorNudge } =
+  new Function(
+    body +
+      "\nreturn { targetOf, detectFailure, textOf, xmlEscape, IGNORED_TOOLS, NUDGE_SEPARATOR, appendNudge, appendErrorNudge }",
+  )()
 
 test("targetOf: stable coarse identity per tool shape", () => {
   const t = targetOf("bash", { command: "ls -la /very/long/path/that/gets/truncated", workdir: "/x" })
@@ -225,4 +240,378 @@ test("env overrides + clamps", () => {
   if (c.READ_SPY !== 2) throw new Error("READ_SPY clamp: " + c.READ_SPY)
   if (c.MAX_FIRES !== 7) throw new Error("MAX_FIRES override: " + c.MAX_FIRES)
   if (c.DELEGATE_HINT !== "my cheap subagent") throw new Error("hint override: " + c.DELEGATE_HINT)
+
+  const disabledSpy = buildConfig({ SPIRAL_GUARD_READ_SPY: "0" })
+  if (disabledSpy.READ_SPY !== 0) throw new Error("SPIRAL_GUARD_READ_SPY=0 must disable (0), got: " + disabledSpy.READ_SPY)
+})
+
+test("targetOf: strips leading cd/export preambles and normalizes whitespace", () => {
+  const longDir = "/Users/dev/worktrees/project-name/fix-12345-some-very-long-branch-slug-that-exceeds-eighty-chars"
+  const t1 = targetOf("bash", { command: `cd ${longDir} && npm test` })
+  const t2 = targetOf("bash", { command: `cd ${longDir} && git status` })
+  if (t1 !== "bash: npm test") throw new Error("cd && preamble not stripped: " + t1)
+  if (t2 !== "bash: git status") throw new Error("cd && preamble collision: " + t2)
+
+  const quoted = targetOf("shell", { command: `cd "${longDir}/sub && dir"; export FOO="a b" BAR=1 && pytest -q` })
+  if (quoted !== "bash: pytest -q") throw new Error("chained/quoted preamble not stripped: " + quoted)
+
+  const ws = targetOf("bash", { command: "  npm   run   lint \n  --fix  " })
+  if (ws !== "bash: npm run lint --fix") throw new Error("whitespace normalization wrong: " + ws)
+
+  // Fallback when the entire command is just cd or export
+  const bareCd = targetOf("bash", { command: "cd /some/dir" })
+  if (bareCd !== "bash: cd /some/dir") throw new Error("bare cd fallback wrong: " + bareCd)
+  const bareExport = targetOf("bash", { command: "export FOO=bar" })
+  if (bareExport !== "bash: export FOO=bar") throw new Error("bare export fallback wrong: " + bareExport)
+})
+
+test("appendNudge: mutates string, array, and empty result.content safely", () => {
+  const rStr = { content: "original output" }
+  if (!appendNudge(rStr, "nudge-1")) throw new Error("appendNudge string failed")
+  if (rStr.content !== `original output${NUDGE_SEPARATOR}nudge-1`) throw new Error("bad string content: " + rStr.content)
+
+  const origArr = [{ type: "text", text: "part1" }]
+  const rArr = { content: origArr }
+  if (!appendNudge(rArr, "nudge-2")) throw new Error("appendNudge array failed")
+  if (rArr.content === origArr) throw new Error("appendNudge mutated array in place instead of replacing")
+  if (rArr.content.length !== 2 || rArr.content[1].text !== "nudge-2") throw new Error("bad array content")
+
+  const rEmpty = {}
+  if (!appendNudge(rEmpty, "nudge-3") || rEmpty.content !== "nudge-3") throw new Error("appendNudge empty failed")
+
+  if (appendNudge(null, "x") !== false) throw new Error("null result should return false")
+  if (appendNudge(Object.freeze({ content: "frozen" }), "x") !== false) throw new Error("frozen result should return false")
+})
+
+test("appendErrorNudge: reconstructs Tool.Error, mutates plain/Error, and handles frozen/empty safely", () => {
+  const plainArgsSym = Symbol.for("effect/Data/Error/plainArgs")
+  class FakeToolError extends Error {
+    constructor(args) {
+      super(args.message)
+      this._tag = "Tool.Error"
+      Object.defineProperty(this, "message", {
+        value: args.message,
+        enumerable: false,
+        writable: true,
+        configurable: true,
+      })
+      if (args.error !== undefined) this.error = args.error
+      if (args.metadata !== undefined) this.metadata = args.metadata
+      Object.defineProperty(this, plainArgsSym, {
+        value: args,
+        enumerable: false,
+        writable: false,
+        configurable: false,
+      })
+    }
+    toJSON() {
+      return { _tag: this._tag, ...this[plainArgsSym] }
+    }
+  }
+
+  const cause = new Error("ENOENT")
+  const meta = { path: "/tmp/a.ts", line: 10 }
+  const evToolErr = {
+    status: "error",
+    error: new FakeToolError({ message: "oldString not found", error: cause, metadata: meta }),
+  }
+  if (!appendErrorNudge(evToolErr, "try reading first")) throw new Error("Tool.Error appendErrorNudge failed")
+  const expectedMsg = `oldString not found${NUDGE_SEPARATOR}try reading first`
+  if (evToolErr.error.message !== expectedMsg) throw new Error("Tool.Error message not updated: " + evToolErr.error.message)
+  if (evToolErr.error.toJSON().message !== expectedMsg)
+    throw new Error("Tool.Error toJSON().message not updated: " + JSON.stringify(evToolErr.error.toJSON()))
+  if (evToolErr.error.error !== cause) throw new Error("Tool.Error defect cause lost")
+  if (evToolErr.error.metadata !== meta) throw new Error("Tool.Error metadata lost")
+
+  // Plain object error
+  const evPlain = { status: "error", error: { message: "plain failure", error: cause, metadata: meta } }
+  if (!appendErrorNudge(evPlain, "nudge-plain")) throw new Error("plain error appendErrorNudge failed")
+  if (evPlain.error.message !== `plain failure${NUDGE_SEPARATOR}nudge-plain`) throw new Error("plain message wrong")
+  if (evPlain.error.error !== cause || evPlain.error.metadata !== meta) throw new Error("plain cause/meta lost")
+
+  // Standard Error / TypeError subclass (where new TypeError(props) would produce "[object Object]")
+  const typeErr = new TypeError("bad argument")
+  typeErr.metadata = meta
+  const evTypeErr = { status: "error", error: typeErr }
+  if (!appendErrorNudge(evTypeErr, "nudge-type")) throw new Error("TypeError appendErrorNudge failed")
+  if (evTypeErr.error.message !== `bad argument${NUDGE_SEPARATOR}nudge-type`)
+    throw new Error("TypeError message wrong: " + evTypeErr.error.message)
+  if (evTypeErr.error.metadata !== meta) throw new Error("TypeError metadata lost")
+
+  // Missing / empty message -> false
+  if (appendErrorNudge({ status: "error", error: {} }, "nudge") !== false) throw new Error("missing message should fail")
+  if (appendErrorNudge({ status: "error", error: { message: "   " } }, "nudge") !== false)
+    throw new Error("whitespace message should fail")
+
+  // Frozen ev or frozen ev.error -> false, never throws, original preserved
+  const frozenErr = Object.freeze({ message: "cannot touch" })
+  const evFrozenChild = { status: "error", error: frozenErr }
+  if (appendErrorNudge(evFrozenChild, "nudge") !== false) throw new Error("frozen ev.error should return false")
+  if (evFrozenChild.error.message !== "cannot touch") throw new Error("frozen ev.error message altered")
+
+  const evFrozenRoot = Object.freeze({
+    status: "error",
+    error: new FakeToolError({ message: "frozen root" }),
+  })
+  if (appendErrorNudge(evFrozenRoot, "nudge") !== false) throw new Error("frozen ev should return false")
+  if (evFrozenRoot.error.message !== "frozen root") throw new Error("frozen ev message altered")
+})
+
+// Build an isolated stateful harness from spiral-guard.ts's real functions
+// with mocked log/toast collectors so evaluate + deliverNudge can be tested
+// deterministically without touching /tmp or spawning osascript.
+function createEngine(configOverrides = {}) {
+  const fnNames = [
+    "IGNORED_TOOLS",
+    "NUDGE_SEPARATOR",
+    "softText",
+    "hardText",
+    "readSpyText",
+    "evictStaleSessions",
+    "sessionState",
+    "pairFor",
+    "targetOf",
+    "detectFailure",
+    "textOf",
+    "probeShape",
+    "evaluate",
+    "appendNudge",
+    "appendErrorNudge",
+    "deliverNudge",
+  ]
+  const code = fnNames.map((n) => detype(extract(n))).join("\n")
+  const cfg = {
+    DISABLED: false,
+    SOFT: 2,
+    HARD: 3,
+    READ_SPY: 3,
+    MAX_FIRES: 2,
+    DEBUG: false,
+    DELEGATE_HINT: "",
+    MAX_SESSIONS: 64,
+    ...configOverrides,
+  }
+  const logs = []
+  const toasts = []
+  const logFn = (kind, target, extra) => {
+    logs.push({ kind, target, ...extra })
+  }
+  const toastFn = async (title, message, opts) => {
+    toasts.push({ title, message, opts })
+  }
+  const factory = new Function(
+    "cfg",
+    "log",
+    "toast",
+    `
+    const { DISABLED, SOFT, HARD, READ_SPY, MAX_FIRES, DEBUG, DELEGATE_HINT, MAX_SESSIONS } = cfg;
+    const sessions = new Map();
+    ${code}
+    function handleAfter(ev) {
+      const probe =
+        ev.status === "completed"
+          ? { status: ev.status, message: undefined, content: ev.result?.content, metadata: ev.result?.metadata }
+          : ev.status === "error"
+            ? { status: ev.status, message: typeof ev.error?.message === "string" ? ev.error.message : undefined, content: undefined, metadata: ev.error?.metadata }
+            : { status: undefined, message: undefined, content: undefined, metadata: undefined };
+      const nudge = evaluate(ev.sessionID, ev.tool, ev.input, probe);
+      if (nudge) deliverNudge(nudge, ev);
+      return nudge;
+    }
+    return { evaluate, deliverNudge, handleAfter, sessions };
+    `,
+  )
+  return { ...factory(cfg, logFn, toastFn), logs, toasts }
+}
+
+test("execute.after: status=error delivers nudge in-band, logs injected-error, and only toasts SOFT on fallback", () => {
+  const { handleAfter, logs, toasts } = createEngine()
+  const sessionID = "ses_err"
+  const input = { path: "/app/foo.ts", oldString: "a", newString: "b" }
+
+  // 1st failure: no nudge yet
+  const ev1 = { tool: "edit", sessionID, input, status: "error", error: { message: "oldString not found (1)" } }
+  handleAfter(ev1)
+  if (ev1.error.message !== "oldString not found (1)") throw new Error("1st failure should not be nudged")
+
+  // 2nd failure: SOFT nudge appended to ev.error.message, logs injected-error, NO SOFT toast
+  const ev2 = { tool: "edit", sessionID, input, status: "error", error: { message: "oldString not found (2)" } }
+  handleAfter(ev2)
+  if (!ev2.error.message.includes("[spiral-guard -- SOFT]")) throw new Error("SOFT nudge missing from ev.error.message")
+  if (!logs.some((l) => l.kind === "injected-error" && l.target === "edit: /app/foo.ts"))
+    throw new Error("expected injected-error log")
+  if (toasts.length !== 0) throw new Error("SOFT toast should NOT fire when in-band injection succeeds")
+
+  // 3rd failure: outcome(failed-again) logged for SOFT, HARD nudge appended, HARD toast fires unconditionally
+  const ev3 = { tool: "edit", sessionID, input, status: "error", error: { message: "oldString not found (3)" } }
+  handleAfter(ev3)
+  if (!ev3.error.message.includes("[spiral-guard -- HARD]")) throw new Error("HARD nudge missing from ev.error.message")
+  const softOutcome = logs.find((l) => l.kind === "outcome" && l.trigger === "SOFT")
+  if (!softOutcome || softOutcome.outcome !== "failed-again" || softOutcome.streak !== 3)
+    throw new Error("expected SOFT failed-again outcome at streak 3, got: " + JSON.stringify(softOutcome))
+  if (toasts.length !== 1 || !toasts[0].opts?.hard) throw new Error("HARD toast should fire unconditionally")
+
+  // Fallback toast on SOFT when ev.error cannot be rewritten (empty message)
+  const { handleAfter: handleFallback, logs: fLogs, toasts: fToasts } = createEngine()
+  handleFallback({ tool: "edit", sessionID: "s2", input, status: "error", error: {} })
+  handleFallback({ tool: "edit", sessionID: "s2", input, status: "error", error: {} })
+  if (!fLogs.some((l) => l.kind === "injected-skipped-error-result"))
+    throw new Error("expected injected-skipped-error-result when ev.error.message is missing")
+  if (fToasts.length !== 1) throw new Error("expected fallback SOFT toast when appendErrorNudge returns false")
+})
+
+test("read-spy: appends one-line hint in-band on READ_SPY-th read, caps at 1 per write cycle, and respects READ_SPY=0", () => {
+  const { handleAfter, logs, toasts } = createEngine({ READ_SPY: 3 })
+  const sessionID = "ses_read"
+  const input = { path: "/app/bar.ts" }
+
+  for (let i = 1; i <= 2; i++) {
+    const ev = { tool: "read", sessionID, input, status: "completed", result: { content: "file body" } }
+    handleAfter(ev)
+    if (ev.result.content !== "file body") throw new Error(`read #${i} should not inject hint`)
+  }
+
+  // 3rd read -> in-band read-spy hint, logs read-spy + injected-read-spy, no toast
+  const ev3 = { tool: "read", sessionID, input, status: "completed", result: { content: "file body" } }
+  handleAfter(ev3)
+  if (!ev3.result.content.includes("[spiral-guard -- read-spy]"))
+    throw new Error("3rd read missing in-band read-spy hint: " + ev3.result.content)
+  if (!logs.some((l) => l.kind === "injected-read-spy" && l.target === "read: /app/bar.ts"))
+    throw new Error("missing injected-read-spy log")
+  if (toasts.length !== 0) throw new Error("read-spy desktop toast must be off by default")
+
+  // Reads 4..6 without an interleaved write -> capped at 1 fire, no second injection
+  for (let i = 4; i <= 6; i++) {
+    const ev = { tool: "read", sessionID, input, status: "completed", result: { content: "file body" } }
+    handleAfter(ev)
+    if (ev.result.content !== "file body") throw new Error(`read #${i} should be capped before write`)
+  }
+
+  // Successful write to /app/bar.ts resets readFires and reads
+  handleAfter({ tool: "write", sessionID, input, status: "completed", result: { content: "ok" } })
+  for (let i = 1; i <= 2; i++) {
+    handleAfter({ tool: "read", sessionID, input, status: "completed", result: { content: "file body" } })
+  }
+  const evAfterWrite = { tool: "read", sessionID, input, status: "completed", result: { content: "file body" } }
+  handleAfter(evAfterWrite)
+  if (!evAfterWrite.result.content.includes("[spiral-guard -- read-spy]"))
+    throw new Error("read-spy should re-arm after a successful write to the same path")
+
+  // SPIRAL_GUARD_READ_SPY=0 disables read-spy completely
+  const { handleAfter: handleDisabled, logs: dLogs } = createEngine({ READ_SPY: 0 })
+  for (let i = 1; i <= 5; i++) {
+    const ev = { tool: "read", sessionID: "s0", input, status: "completed", result: { content: "body" } }
+    handleDisabled(ev)
+    if (ev.result.content !== "body") throw new Error("READ_SPY=0 must never inject")
+  }
+  if (dLogs.length !== 0) throw new Error("READ_SPY=0 should emit no read-spy logs")
+})
+
+test("outcomes + write-resets-edit: interleaved reads preserve pending edit nudge, write recovers edit streak", () => {
+  const { handleAfter, logs } = createEngine()
+  const sessionID = "ses_recover"
+  const input = { path: "/app/baz.ts" }
+
+  // Two failing edits -> SOFT nudge pending on edit: /app/baz.ts
+  handleAfter({ tool: "edit", sessionID, input, status: "error", error: { message: "fail 1" } })
+  handleAfter({ tool: "edit", sessionID, input, status: "error", error: { message: "fail 2" } })
+
+  // Interleaved read (as instructed by SOFT nudge) must NOT emit an outcome or clear pendingNudge
+  handleAfter({ tool: "read", sessionID, input, status: "completed", result: { content: "lines" } })
+  if (logs.some((l) => l.kind === "outcome")) throw new Error("interleaved read must not resolve edit pendingNudge")
+
+  // Switching to a successful write on the same path resolves edit's pendingNudge as recovered and resets edit's streak
+  handleAfter({ tool: "write", sessionID, input, status: "completed", result: { content: "written" } })
+  const outcome = logs.find((l) => l.kind === "outcome" && l.target === "edit: /app/baz.ts")
+  if (!outcome || outcome.outcome !== "recovered" || outcome.trigger !== "SOFT" || outcome.streak !== 2)
+    throw new Error("write should log recovered outcome for pending edit nudge: " + JSON.stringify(outcome))
+  const reset = logs.find((l) => l.kind === "fail-streak-reset" && l.target === "edit: /app/baz.ts")
+  if (!reset || reset.streak !== 2)
+    throw new Error("write should log fail-streak-reset for edit: " + JSON.stringify(reset))
+
+  // A subsequent single failing edit starts back at streak 1 (not streak 3 / HARD)
+  handleAfter({ tool: "edit", sessionID, input, status: "error", error: { message: "fail again" } })
+  const lastFail = [...logs].reverse().find((l) => l.kind === "failure" && l.target === "edit: /app/baz.ts")
+  if (!lastFail || lastFail.streak !== 1)
+    throw new Error("expected edit streak to restart at 1 after write reset, got: " + JSON.stringify(lastFail))
+})
+
+test("summarize-log: parses triggers, delivery breakdown, and per-tool/per-delivery outcomes", () => {
+  const sampleLines = [
+    // 1. bash SOFT -> injected -> recovered
+    { kind: "failure", sessionID: "s1", target: "bash: npm test", streak: 1 },
+    { kind: "failure", sessionID: "s1", target: "bash: npm test", streak: 2 },
+    { kind: "SOFT", sessionID: "s1", target: "bash: npm test", text: "soft" },
+    { kind: "injected", sessionID: "s1", target: "bash: npm test", text: "soft" },
+    { kind: "outcome", sessionID: "s1", target: "bash: npm test", trigger: "SOFT", outcome: "recovered", streak: 2 },
+    { kind: "fail-streak-reset", sessionID: "s1", target: "bash: npm test", streak: 2 },
+
+    // 2. edit SOFT (injected-error) -> interleaved read-spy -> recovered via edit
+    { kind: "failure", sessionID: "s1", target: "edit: /a.ts", streak: 2 },
+    { kind: "SOFT", sessionID: "s1", target: "edit: /a.ts", text: "soft" },
+    { kind: "injected-error", sessionID: "s1", target: "edit: /a.ts", text: "soft" },
+    { kind: "read-spy", sessionID: "s1", target: "read: /a.ts", text: "spy" },
+    { kind: "injected-read-spy", sessionID: "s1", target: "read: /a.ts", text: "spy" },
+    { kind: "outcome", sessionID: "s1", target: "edit: /a.ts", trigger: "SOFT", outcome: "recovered", streak: 2 },
+    { kind: "fail-streak-reset", sessionID: "s1", target: "edit: /a.ts", streak: 2 },
+
+    // 3. edit SOFT (injected-error) -> failed-again -> HARD (injected-skipped-error-result) -> moved-on (EOF)
+    { kind: "SOFT", sessionID: "s2", target: "edit: /b.ts", text: "soft" },
+    { kind: "injected-error", sessionID: "s2", target: "edit: /b.ts", text: "soft" },
+    { kind: "outcome", sessionID: "s2", target: "edit: /b.ts", trigger: "SOFT", outcome: "failed-again", streak: 3 },
+    { kind: "failure", sessionID: "s2", target: "edit: /b.ts", streak: 3 },
+    { kind: "HARD", sessionID: "s2", target: "edit: /b.ts", text: "hard" },
+    { kind: "injected-skipped-error-result", sessionID: "s2", target: "edit: /b.ts", text: "hard" },
+  ]
+  const jsonl = sampleLines.map((l) => JSON.stringify(l)).join("\n") + "\n"
+  const s = summarizeLog(jsonl)
+
+  if (s.triggers.total !== 5 || s.triggers.SOFT !== 3 || s.triggers.HARD !== 1 || s.triggers["read-spy"] !== 1)
+    throw new Error("trigger counts wrong: " + JSON.stringify(s.triggers))
+  if (
+    s.delivery.injected !== 1 ||
+    s.delivery["injected-error"] !== 2 ||
+    s.delivery["injected-read-spy"] !== 1 ||
+    s.delivery["injected-skipped-error-result"] !== 1
+  )
+    throw new Error("delivery counts wrong: " + JSON.stringify(s.delivery))
+  if (s.outcomes.recovered !== 2 || s.outcomes["failed-again"] !== 1 || s.outcomes["moved-on"] !== 1)
+    throw new Error("outcome counts wrong: " + JSON.stringify(s.outcomes))
+  if (s.byTool.bash.recovered !== 1 || s.byTool.edit.recovered !== 1 || s.byTool.edit["failed-again"] !== 1 || s.byTool.edit["moved-on"] !== 1)
+    throw new Error("byTool counts wrong: " + JSON.stringify(s.byTool))
+  if (
+    s.byDelivery.injected.recovered !== 1 ||
+    s.byDelivery["injected-error"].recovered !== 1 ||
+    s.byDelivery["injected-error"]["failed-again"] !== 1 ||
+    s.byDelivery["injected-skipped-error-result"]["moved-on"] !== 1
+  )
+    throw new Error("byDelivery counts wrong: " + JSON.stringify(s.byDelivery))
+
+  const formatted = formatSummary(s)
+  for (const token of [
+    "Triggers: total=5",
+    "injected=1",
+    "injected-error=2",
+    "injected-read-spy=1",
+    "injected-skipped-error-result=1",
+    "recovered=2",
+    "failed-again=1",
+    "moved-on=1",
+  ]) {
+    if (!formatted.includes(token)) throw new Error(`formatted output missing "${token}":\n${formatted}`)
+  }
+
+  // Verify CLI entrypoint end-to-end on a temp file
+  const dir = mkdtempSync(join(tmpdir(), "spiral-guard-test-"))
+  try {
+    const p = join(dir, "test.jsonl")
+    writeFileSync(p, jsonl, "utf8")
+    const cliOut = execFileSync(process.execPath, [new URL("./scripts/summarize-log.mjs", import.meta.url).pathname, p], {
+      encoding: "utf8",
+    })
+    if (!cliOut.includes("Triggers: total=5") || !cliOut.includes("recovered=2"))
+      throw new Error("CLI output mismatch:\n" + cliOut)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

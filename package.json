@@ -5,10 +5,11 @@
   "type": "module",
   "main": "spiral-guard.ts",
   "scripts": {
-    "test": "node --test spiral-guard.test.mjs"
+    "test": "node --test spiral-guard.test.mjs",
+    "summary": "node scripts/summarize-log.mjs"
   },
   "keywords": ["opencode", "opencode-plugin", "agent-safety", "doom-loop"],
-  "files": ["spiral-guard.ts", "README.md", "LICENSE"],
+  "files": ["spiral-guard.ts", "scripts/summarize-log.mjs", "README.md", "LICENSE"],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/oakwood-commons/spiral-guard.git"
