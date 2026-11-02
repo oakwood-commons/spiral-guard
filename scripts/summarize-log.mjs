@@ -14,7 +14,7 @@ const DELIVERY_KINDS = [
 ]
 
 function emptyOutcomeBucket() {
-  return { total: 0, recovered: 0, "failed-again": 0, "moved-on": 0 }
+  return { total: 0, recovered: 0, "failed-again": 0, "moved-on": 0, pending: 0 }
 }
 
 function toolOfTarget(target) {
@@ -42,6 +42,7 @@ export function summarizeLog(content) {
     recovered: 0,
     "failed-again": 0,
     "moved-on": 0,
+    pending: 0,
   }
   const byTool = {}
   const byDelivery = {}
@@ -73,6 +74,15 @@ export function summarizeLog(content) {
   const pending = new Map()
   let totalLines = 0
 
+  function resolveOtherTargetsInSession(sessionID, currentTarget) {
+    for (const [k, cur] of pending) {
+      if (cur.sessionID === sessionID && cur.target !== currentTarget) {
+        pending.delete(k)
+        recordOutcome(cur, "moved-on")
+      }
+    }
+  }
+
   const lines = String(content ?? "").split(/\r?\n/)
   for (const raw of lines) {
     const line = raw.trim()
@@ -93,6 +103,7 @@ export function summarizeLog(content) {
     const key = `${sessionID}\0${target}`
 
     if (kind === "SOFT" || kind === "HARD") {
+      resolveOtherTargetsInSession(sessionID, target)
       triggers[kind] += 1
       triggers.nudgeTotal += 1
       triggers.total += 1
@@ -153,9 +164,12 @@ export function summarizeLog(content) {
     }
 
     // Fallback for historical logs (pre-outcome event): resolve pending nudge
-    // on the next non-read fail-streak-reset or failure for that target.
-    // Interleaved read calls never touch pending edit/bash nudges.
+    // on the next non-read fail-streak-reset or failure for that target, or as
+    // moved-on when subsequent non-read activity in the session targets another
+    // target. Interleaved read calls never touch pending edit/bash nudges.
     if (tool === "read") continue
+
+    resolveOtherTargetsInSession(sessionID, target)
 
     if (kind === "fail-streak-reset") {
       const cur = pending.get(key)
@@ -176,10 +190,10 @@ export function summarizeLog(content) {
     }
   }
 
-  // Any SOFT/HARD trigger with no subsequent call on that target in the log
-  // means the agent moved on from repeating that target.
+  // Any SOFT/HARD trigger still unresolved at EOF stays in `pending` -- EOF
+  // alone does not establish that the agent moved on.
   for (const [, cur] of pending) {
-    recordOutcome(cur, "moved-on")
+    recordOutcome(cur, "pending")
   }
   pending.clear()
 
@@ -207,7 +221,7 @@ export function formatSummary(summary) {
       (summary.delivery["inject-failed"] ? `, inject-failed=${summary.delivery["inject-failed"]}` : ""),
   )
   lines.push(
-    `Outcomes (SOFT+HARD): recovered=${summary.outcomes.recovered}, failed-again=${summary.outcomes["failed-again"]}, moved-on=${summary.outcomes["moved-on"]}`,
+    `Outcomes (SOFT+HARD): recovered=${summary.outcomes.recovered}, failed-again=${summary.outcomes["failed-again"]}, moved-on=${summary.outcomes["moved-on"]}, pending=${summary.outcomes.pending}`,
   )
 
   const delivKeys = Object.keys(summary.byDelivery)
@@ -217,7 +231,7 @@ export function formatSummary(summary) {
     for (const k of delivKeys) {
       const b = summary.byDelivery[k]
       lines.push(
-        `  ${k}: total=${b.total}, recovered=${b.recovered}, failed-again=${b["failed-again"]}, moved-on=${b["moved-on"]}`,
+        `  ${k}: total=${b.total}, recovered=${b.recovered}, failed-again=${b["failed-again"]}, moved-on=${b["moved-on"]}, pending=${b.pending}`,
       )
     }
   }
@@ -229,7 +243,7 @@ export function formatSummary(summary) {
     for (const k of toolKeys) {
       const b = summary.byTool[k]
       lines.push(
-        `  ${k}: total=${b.total}, recovered=${b.recovered}, failed-again=${b["failed-again"]}, moved-on=${b["moved-on"]}`,
+        `  ${k}: total=${b.total}, recovered=${b.recovered}, failed-again=${b["failed-again"]}, moved-on=${b["moved-on"]}, pending=${b.pending}`,
       )
     }
   }

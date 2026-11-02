@@ -355,6 +355,19 @@ test("appendErrorNudge: reconstructs Tool.Error, mutates plain/Error, and handle
   })
   if (appendErrorNudge(evFrozenRoot, "nudge") !== false) throw new Error("frozen ev should return false")
   if (evFrozenRoot.error.message !== "frozen root") throw new Error("frozen ev message altered")
+
+  // Non-writable ev.error carrying Tool.Error -> must return false (cannot replace Tool.Error or leave plainArgs stale)
+  const evNonWritable = { status: "error" }
+  Object.defineProperty(evNonWritable, "error", {
+    value: new FakeToolError({ message: "non-writable error prop" }),
+    writable: false,
+    enumerable: true,
+    configurable: false,
+  })
+  if (appendErrorNudge(evNonWritable, "nudge") !== false)
+    throw new Error("non-writable ev.error carrying Tool.Error should return false")
+  if (evNonWritable.error.message !== "non-writable error prop")
+    throw new Error("non-writable Tool.Error message should not be partially mutated")
 })
 
 // Build an isolated stateful harness from spiral-guard.ts's real functions
@@ -534,6 +547,13 @@ test("outcomes + write-resets-edit: interleaved reads preserve pending edit nudg
   const lastFail = [...logs].reverse().find((l) => l.kind === "failure" && l.target === "edit: /app/baz.ts")
   if (!lastFail || lastFail.streak !== 1)
     throw new Error("expected edit streak to restart at 1 after write reset, got: " + JSON.stringify(lastFail))
+
+  // Trigger SOFT on edit: /app/baz.ts again (streak 2), then move on to a different non-read target
+  handleAfter({ tool: "edit", sessionID, input, status: "error", error: { message: "fail 2 again" } })
+  handleAfter({ tool: "bash", sessionID, input: { command: "git status" }, status: "completed", result: { content: "ok" } })
+  const movedOn = [...logs].reverse().find((l) => l.kind === "outcome" && l.target === "edit: /app/baz.ts")
+  if (!movedOn || movedOn.outcome !== "moved-on" || movedOn.trigger !== "SOFT")
+    throw new Error("expected moved-on outcome when switching to another non-read target: " + JSON.stringify(movedOn))
 })
 
 test("summarize-log: parses triggers, delivery breakdown, and per-tool/per-delivery outcomes", () => {
@@ -555,32 +575,49 @@ test("summarize-log: parses triggers, delivery breakdown, and per-tool/per-deliv
     { kind: "outcome", sessionID: "s1", target: "edit: /a.ts", trigger: "SOFT", outcome: "recovered", streak: 2 },
     { kind: "fail-streak-reset", sessionID: "s1", target: "edit: /a.ts", streak: 2 },
 
-    // 3. edit SOFT (injected-error) -> failed-again -> HARD (injected-skipped-error-result) -> moved-on (EOF)
+    // 3. edit SOFT (injected-error) -> failed-again -> HARD (injected-skipped-error-result) -> moved-on via subsequent activity on another target
     { kind: "SOFT", sessionID: "s2", target: "edit: /b.ts", text: "soft" },
     { kind: "injected-error", sessionID: "s2", target: "edit: /b.ts", text: "soft" },
     { kind: "outcome", sessionID: "s2", target: "edit: /b.ts", trigger: "SOFT", outcome: "failed-again", streak: 3 },
     { kind: "failure", sessionID: "s2", target: "edit: /b.ts", streak: 3 },
     { kind: "HARD", sessionID: "s2", target: "edit: /b.ts", text: "hard" },
     { kind: "injected-skipped-error-result", sessionID: "s2", target: "edit: /b.ts", text: "hard" },
+    { kind: "failure", sessionID: "s2", target: "bash: git status", streak: 1 },
+
+    // 4. Unresolved SOFT at EOF stays in `pending` (not inflated into moved-on)
+    { kind: "SOFT", sessionID: "s3", target: "bash: npm run build", text: "soft" },
+    { kind: "injected", sessionID: "s3", target: "bash: npm run build", text: "soft" },
   ]
   const jsonl = sampleLines.map((l) => JSON.stringify(l)).join("\n") + "\n"
   const s = summarizeLog(jsonl)
 
-  if (s.triggers.total !== 5 || s.triggers.SOFT !== 3 || s.triggers.HARD !== 1 || s.triggers["read-spy"] !== 1)
+  if (s.triggers.total !== 6 || s.triggers.SOFT !== 4 || s.triggers.HARD !== 1 || s.triggers["read-spy"] !== 1)
     throw new Error("trigger counts wrong: " + JSON.stringify(s.triggers))
   if (
-    s.delivery.injected !== 1 ||
+    s.delivery.injected !== 2 ||
     s.delivery["injected-error"] !== 2 ||
     s.delivery["injected-read-spy"] !== 1 ||
     s.delivery["injected-skipped-error-result"] !== 1
   )
     throw new Error("delivery counts wrong: " + JSON.stringify(s.delivery))
-  if (s.outcomes.recovered !== 2 || s.outcomes["failed-again"] !== 1 || s.outcomes["moved-on"] !== 1)
+  if (
+    s.outcomes.recovered !== 2 ||
+    s.outcomes["failed-again"] !== 1 ||
+    s.outcomes["moved-on"] !== 1 ||
+    s.outcomes.pending !== 1
+  )
     throw new Error("outcome counts wrong: " + JSON.stringify(s.outcomes))
-  if (s.byTool.bash.recovered !== 1 || s.byTool.edit.recovered !== 1 || s.byTool.edit["failed-again"] !== 1 || s.byTool.edit["moved-on"] !== 1)
+  if (
+    s.byTool.bash.recovered !== 1 ||
+    s.byTool.bash.pending !== 1 ||
+    s.byTool.edit.recovered !== 1 ||
+    s.byTool.edit["failed-again"] !== 1 ||
+    s.byTool.edit["moved-on"] !== 1
+  )
     throw new Error("byTool counts wrong: " + JSON.stringify(s.byTool))
   if (
     s.byDelivery.injected.recovered !== 1 ||
+    s.byDelivery.injected.pending !== 1 ||
     s.byDelivery["injected-error"].recovered !== 1 ||
     s.byDelivery["injected-error"]["failed-again"] !== 1 ||
     s.byDelivery["injected-skipped-error-result"]["moved-on"] !== 1
@@ -589,14 +626,15 @@ test("summarize-log: parses triggers, delivery breakdown, and per-tool/per-deliv
 
   const formatted = formatSummary(s)
   for (const token of [
-    "Triggers: total=5",
-    "injected=1",
+    "Triggers: total=6",
+    "injected=2",
     "injected-error=2",
     "injected-read-spy=1",
     "injected-skipped-error-result=1",
     "recovered=2",
     "failed-again=1",
     "moved-on=1",
+    "pending=1",
   ]) {
     if (!formatted.includes(token)) throw new Error(`formatted output missing "${token}":\n${formatted}`)
   }
@@ -609,7 +647,7 @@ test("summarize-log: parses triggers, delivery breakdown, and per-tool/per-deliv
     const cliOut = execFileSync(process.execPath, [new URL("./scripts/summarize-log.mjs", import.meta.url).pathname, p], {
       encoding: "utf8",
     })
-    if (!cliOut.includes("Triggers: total=5") || !cliOut.includes("recovered=2"))
+    if (!cliOut.includes("Triggers: total=6") || !cliOut.includes("recovered=2") || !cliOut.includes("pending=1"))
       throw new Error("CLI output mismatch:\n" + cliOut)
   } finally {
     rmSync(dir, { recursive: true, force: true })

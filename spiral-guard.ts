@@ -515,6 +515,24 @@ function evaluate(sessionID: string, tool: string, args: unknown, ev: { status?:
     }
   }
 
+  // Any non-read tool call on a different target resolves pending nudges on
+  // earlier targets in this session as "moved-on" (except a successful write
+  // to the same file as a pending edit, which already resolved as "recovered"
+  // above).
+  if (tool !== "read") {
+    for (const [otherTarget, otherPair] of state.pairs) {
+      if (otherTarget !== target && otherPair.pendingNudge) {
+        log("outcome", otherTarget, {
+          sessionID,
+          trigger: otherPair.pendingNudge,
+          outcome: "moved-on",
+          streak: otherPair.fails,
+        })
+        otherPair.pendingNudge = undefined
+      }
+    }
+  }
+
   if (!isError) return
 
   p.fails += 1
@@ -617,7 +635,8 @@ function appendErrorNudge(ev: unknown, nudge: string): boolean {
     if (typeof orig.message !== "string" || !orig.message.trim()) return false
     const nextMessage = `${orig.message}${NUDGE_SEPARATOR}${nudge}`
     const ctor = orig.constructor
-    if (typeof ctor === "function" && (orig._tag === "Tool.Error" || (ctor !== Object && ctor !== Error))) {
+    const isToolError = orig._tag === "Tool.Error"
+    if (typeof ctor === "function" && (isToolError || (ctor !== Object && ctor !== Error))) {
       try {
         const props = {
           message: nextMessage,
@@ -627,12 +646,15 @@ function appendErrorNudge(ev: unknown, nudge: string): boolean {
         const rebuilt = Reflect.construct(ctor, [props]) as Record<string, unknown>
         if (rebuilt && typeof rebuilt === "object" && rebuilt.message === nextMessage) {
           e.error = rebuilt
-          if (e.error === rebuilt) return true
+          return e.error === rebuilt
         }
       } catch {
-        /* fall through to direct mutation */
+        if (isToolError) return false
+        /* non-Tool.Error custom class: fall through to direct mutation */
       }
+      if (isToolError) return false
     }
+    if (isToolError) return false
     orig.message = nextMessage
     return orig.message === nextMessage
   } catch {
