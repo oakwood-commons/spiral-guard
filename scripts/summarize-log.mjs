@@ -189,12 +189,13 @@ export function summarizeLog(content) {
     }
 
     // Fallback for historical logs (pre-outcome event): resolve pending nudge
-    // on the next non-read fail-streak-reset or failure for that target, or as
-    // moved-on when subsequent non-read activity in the session targets another
-    // target. Interleaved read calls never touch pending edit/bash nudges.
-    if (tool === "read") continue
-
-    resolveOtherTargetsInSession(sessionID, target, kind)
+    // on the next fail-streak-reset or failure for that exact target (including
+    // `read: <path>`), or as moved-on when subsequent non-read activity in the
+    // session targets another target. Interleaved read calls never touch pending
+    // nudges on other targets.
+    if (tool !== "read") {
+      resolveOtherTargetsInSession(sessionID, target, kind)
+    }
 
     if (kind === "fail-streak-reset") {
       const cur = pending.get(key)

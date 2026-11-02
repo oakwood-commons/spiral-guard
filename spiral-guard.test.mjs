@@ -368,6 +368,26 @@ test("appendErrorNudge: reconstructs Tool.Error, mutates plain/Error, and handle
     throw new Error("non-writable ev.error carrying Tool.Error should return false")
   if (evNonWritable.error.message !== "non-writable error prop")
     throw new Error("non-writable Tool.Error message should not be partially mutated")
+
+  // Non-Tool.Error custom subclass whose constructor only accepts `{ message }`
+  // must mutate in place rather than rebuilding and discarding `.error`/`.metadata`
+  class CustomPayloadError extends Error {
+    constructor({ message }) {
+      super(message)
+    }
+  }
+  const customErr = new CustomPayloadError({ message: "subclass boom" })
+  customErr.error = new Error("original cause")
+  customErr.metadata = { code: 42 }
+  const evCustom = { status: "error", error: customErr }
+  if (!appendErrorNudge(evCustom, "subclass nudge"))
+    throw new Error("appendErrorNudge returned false for CustomPayloadError")
+  if (evCustom.error !== customErr)
+    throw new Error("non-Tool.Error subclass should be mutated in place, not replaced")
+  if (evCustom.error.message !== "subclass boom\n\n---\nsubclass nudge")
+    throw new Error("CustomPayloadError message mismatch: " + evCustom.error.message)
+  if (evCustom.error.error !== customErr.error || evCustom.error.metadata?.code !== 42)
+    throw new Error("CustomPayloadError lost .error or .metadata payload")
 })
 
 // Build an isolated stateful harness from spiral-guard.ts's real functions
@@ -565,6 +585,19 @@ test("outcomes + write-resets-edit: interleaved reads preserve pending edit nudg
   const movedOnViaTask = [...logs].reverse().find((l) => l.kind === "outcome" && l.target === "edit: /app/baz.ts")
   if (!movedOnViaTask || movedOnViaTask.outcome !== "moved-on" || movedOnViaTask.trigger !== "HARD")
     throw new Error("expected moved-on outcome when delegating via task tool: " + JSON.stringify(movedOnViaTask))
+
+  // Two failing reads trigger SOFT on read: /app/baz.ts; a successful retry of that same read
+  // resolves its own pendingNudge as recovered and resets its failure streak (so a subsequent
+  // edit does not misclassify the read nudge as moved-on)
+  handleAfter({ tool: "read", sessionID, input, status: "error", error: { message: "ENOENT 1" } })
+  handleAfter({ tool: "read", sessionID, input, status: "error", error: { message: "ENOENT 2" } })
+  handleAfter({ tool: "read", sessionID, input, status: "completed", result: { content: "now exists" } })
+  const readRecovered = [...logs].reverse().find((l) => l.kind === "outcome" && l.target === "read: /app/baz.ts")
+  if (!readRecovered || readRecovered.outcome !== "recovered" || readRecovered.trigger !== "SOFT" || readRecovered.streak !== 2)
+    throw new Error("expected successful read retry to log recovered outcome: " + JSON.stringify(readRecovered))
+  const readReset = [...logs].reverse().find((l) => l.kind === "fail-streak-reset" && l.target === "read: /app/baz.ts")
+  if (!readReset || readReset.streak !== 2)
+    throw new Error("expected successful read retry to log fail-streak-reset: " + JSON.stringify(readReset))
 })
 
 test("summarize-log: parses triggers, delivery breakdown, and per-tool/per-delivery outcomes", () => {

@@ -471,6 +471,21 @@ function evaluate(sessionID: string, tool: string, args: unknown, ev: { status?:
   const p = pairFor(state, target)
   const isError = detectFailure(tool, ev)
 
+  // A successful tool call (including a retry of a previously failing
+  // `read: <path>`) resolves any pending nudge on this target and resets
+  // its failure streak before read-spy runs (deliberately NOT the read
+  // counter -- read-spy tracks a different smell). Interleaved reads still
+  // do not touch pending nudges on OTHER targets (`moved-on` below is gated
+  // on `tool !== "read"`).
+  if (!isError) {
+    if (p.pendingNudge) {
+      log("outcome", target, { sessionID, trigger: p.pendingNudge, outcome: "recovered", streak: p.fails })
+      p.pendingNudge = undefined
+    }
+    if (p.fails > 0) log("fail-streak-reset", target, { sessionID, streak: p.fails })
+    p.fails = 0
+  }
+
   // Read-spy: reads of one file piling up with no interleaved write.
   // Appends a one-line in-band hint on the READ_SPY-th completed read,
   // capped at 1 fire per file per write cycle (readFires resets on a
@@ -484,18 +499,6 @@ function evaluate(sessionID: string, tool: string, args: unknown, ev: { status?:
       log("read-spy", target, { sessionID, text })
       return text
     }
-  }
-
-  // A successful non-read tool call resolves any pending nudge on this
-  // target and resets its failure streak (deliberately NOT the read
-  // counter -- read-spy tracks a different smell).
-  if (!isError && tool !== "read") {
-    if (p.pendingNudge) {
-      log("outcome", target, { sessionID, trigger: p.pendingNudge, outcome: "recovered", streak: p.fails })
-      p.pendingNudge = undefined
-    }
-    if (p.fails > 0) log("fail-streak-reset", target, { sessionID, streak: p.fails })
-    p.fails = 0
   }
 
   // A successful edit/write to a file IS the write read-spy is waiting for,
@@ -658,27 +661,30 @@ function appendErrorNudge(ev: unknown, nudge: string): boolean {
     const orig = e.error as Record<string, unknown>
     if (typeof orig.message !== "string" || !orig.message.trim()) return false
     const nextMessage = `${orig.message}${NUDGE_SEPARATOR}${nudge}`
-    const ctor = orig.constructor
-    const isToolError = orig._tag === "Tool.Error"
-    if (typeof ctor === "function" && (isToolError || (ctor !== Object && ctor !== Error))) {
+    if (orig._tag === "Tool.Error") {
+      if (typeof orig.constructor !== "function") return false
       try {
         const props = {
           message: nextMessage,
           ...(orig.error !== undefined ? { error: orig.error } : {}),
           ...(orig.metadata !== undefined ? { metadata: orig.metadata } : {}),
         }
-        const rebuilt = Reflect.construct(ctor, [props]) as Record<string, unknown>
-        if (rebuilt && typeof rebuilt === "object" && rebuilt.message === nextMessage) {
+        const rebuilt = Reflect.construct(orig.constructor, [props]) as Record<string, unknown>
+        if (
+          rebuilt &&
+          typeof rebuilt === "object" &&
+          rebuilt.message === nextMessage &&
+          (orig.error === undefined || rebuilt.error === orig.error) &&
+          (orig.metadata === undefined || rebuilt.metadata === orig.metadata)
+        ) {
           e.error = rebuilt
           return e.error === rebuilt
         }
       } catch {
-        if (isToolError) return false
-        /* non-Tool.Error custom class: fall through to direct mutation */
+        return false
       }
-      if (isToolError) return false
+      return false
     }
-    if (isToolError) return false
     orig.message = nextMessage
     return orig.message === nextMessage
   } catch {
